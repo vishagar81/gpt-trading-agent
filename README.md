@@ -96,7 +96,7 @@ Once the dependencies are installed and your API keys are set, you can start the
 
 - Run the following command:
 ```
-streamlit run stock_picker_app.py
+streamlit run trading-agent.py
 ```
 Your default web browser will automatically open a new tab with the running application.
 
