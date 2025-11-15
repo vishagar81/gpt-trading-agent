@@ -1,0 +1,1542 @@
+"""
+CLAUDE-POWERED AI TRADING AGENT
+================================
+This is an alternative version of the trading agent that uses Claude AI instead of OpenAI and Perplexity.
+It maintains all the original functionality while replacing the LLM calls with Claude's API.
+
+To use this version:
+1. Ensure you have CLAUDE_API_KEY in your .env file (get it from https://console.anthropic.com/)
+2. Run: streamlit run trading-agent-claude.py
+3. All other features remain the same as the original trading-agent.py
+
+Key Differences from Original:
+- Uses Claude Sonnet 4.5 for all AI analysis and recommendations
+- Replaces Perplexity API calls with Claude for stock discovery
+- Replaces OpenAI API calls with Claude for financial analysis, hedging, and trend query generation
+- All other features (trading, portfolio tracking, data sources) remain unchanged
+"""
+
+import streamlit as st
+import pandas as pd
+import pandas_ta as ta
+import requests
+import yfinance as yf
+import os
+from datetime import datetime, date, timedelta
+from dotenv import load_dotenv
+import alpaca_trade_api as tradeapi
+import numpy as np
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from pytrends.request import TrendReq
+import plotly.express as px
+import vectorbt as vbt
+from fredapi import Fred
+import praw
+from anthropic import Anthropic
+
+# --- Configuration ---
+load_dotenv()
+CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
+QUANTIQ_API_KEY = os.environ.get("QUANTIQ_API")
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
+# Use paper trading by default, change to "false" in .env for live
+ALPACA_PAPER = os.environ.get("ALPACA_PAPER", "true").lower() == "true"
+FMP_API_KEY = os.environ.get("FMP_API_KEY")
+FRED_API_KEY = os.environ.get("FRED_API_KEY")
+REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID")
+REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET")
+REDDIT_USER_AGENT = os.environ.get("REDDIT_USER_AGENT", "StockAnalysisBot/1.0")
+NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY")
+
+# Initialize Claude client
+if not CLAUDE_API_KEY or CLAUDE_API_KEY == "YOUR_CLAUDE_API_KEY":
+    claude_client = None
+else:
+    claude_client = Anthropic(api_key=CLAUDE_API_KEY)
+
+PORTFOLIO_CSV = "portfolio.csv"
+MODEL_NAME = "claude-sonnet-4-5-20250929"  # Latest Claude model
+
+# --- Helper Functions ---
+def get_company_name(ticker):
+    """Gets the company's long name from its ticker using yfinance."""
+    try:
+        stock_info = yf.Ticker(ticker).info
+        return stock_info.get('longName', ticker) # Fallback to ticker if name not found
+    except Exception:
+        return ticker
+
+def get_polymarket_odds(ticker, limit=3):
+    """
+    Searches Polymarket for markets related to a specific stock ticker.
+    Uses both the ticker symbol and company name for better results.
+    """
+    try:
+        # Get company name from the ticker
+        company_name = get_company_name(ticker)
+
+        # Create search keywords - use both ticker and company name
+        keywords = [ticker]
+
+        # Clean company name for better searching (remove corporate suffixes)
+        if company_name and company_name != ticker:
+            clean_name = company_name
+            # Remove common corporate suffixes
+            suffixes = [' Inc.', ' Corp.', ' Corporation', ' Company', ' Ltd.', ' Limited', ' PLC', ' NV']
+            for suffix in suffixes:
+                clean_name = clean_name.split(suffix)[0]
+            keywords.append(clean_name)
+
+            # Also try the full company name
+            keywords.append(company_name)
+
+        # Remove duplicates
+        keywords = list(set(keywords))
+
+        st.info(f"Searching Polymarket for: {', '.join(keywords)}")
+
+        # Polymarket API endpoint
+        url = "https://gamma-api.polymarket.com/markets"
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Referer": "https://polymarket.com/"
+        }
+
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        # Extract markets from response
+        if isinstance(data, dict) and 'markets' in data:
+            markets = data['markets']
+        elif isinstance(data, list):
+            markets = data
+        else:
+            return f"No market data found for {ticker}."
+
+        if not markets:
+            return f"No markets data found for {ticker}."
+
+        # Filter for ACTIVE markets with valid price data that match our keywords
+        filtered = []
+        for market in markets:
+            # Skip if not a dictionary
+            if not isinstance(market, dict):
+                continue
+
+            # Check if market is active (not closed/resolved)
+            state = market.get('state', '').lower()
+            if state not in ['open', 'active', 'trading']:
+                continue
+
+            # Check if market has current price data
+            outcomes = market.get('outcomes', [])
+            if not outcomes or not isinstance(outcomes, list):
+                continue
+
+            # Check if any outcome has a valid price
+            has_valid_prices = False
+            for outcome in outcomes:
+                if isinstance(outcome, dict) and 'price' in outcome:
+                    price = outcome.get('price')
+                    if isinstance(price, (int, float)) and price > 0:
+                        has_valid_prices = True
+                        break
+
+            if not has_valid_prices:
+                continue
+
+            # Now check if it matches our keywords (ticker or company name)
+            question = market.get('question', '').lower()
+            title = market.get('title', '').lower()
+            description = market.get('description', '').lower()
+            market_text = f"{question} {title} {description}".lower()
+
+            # Check if any keyword matches the market text
+            keyword_matches = any(
+                keyword.lower() in market_text
+                for keyword in keywords
+                if keyword  # Skip empty keywords
+            )
+
+            if keyword_matches:
+                filtered.append(market)
+
+        if not filtered:
+            return f"No active prediction markets found for {ticker} ({company_name})."
+
+        # Format results with current prices
+        results = []
+        for market in filtered[:limit]:
+            question = market.get('question', market.get('title', 'Unknown Market'))
+            outcomes = market.get('outcomes', [])
+
+            outcome_prices = []
+            for outcome in outcomes:
+                if isinstance(outcome, dict):
+                    name = outcome.get('name', 'Unknown')
+                    price = outcome.get('price', 0)
+                    # Only include if we have a valid price
+                    if isinstance(price, (int, float)) and price > 0:
+                        outcome_prices.append(f"{name}: {price:.0%}")
+
+            if outcome_prices:
+                results.append(f"'{question}' → " + " | ".join(outcome_prices))
+
+        if not results:
+            return f"Markets found for {ticker} but no current price data available."
+
+        return " | ".join(results)
+
+    except Exception as e:
+        return f"Error fetching Polymarket data for {ticker}: {str(e)}"
+
+@st.cache_data
+def get_earnings_calendar(tickers):
+    """
+    Fetches the next earnings date for a list of stock tickers, handling the new dictionary format from yfinance.
+    """
+    earnings_data = []
+    for ticker in tickers:
+        try:
+            stock = yf.Ticker(ticker)
+            calendar = stock.calendar
+
+            if calendar and 'Earnings Date' in calendar:
+                earnings_dates = calendar.get('Earnings Date')
+
+                if earnings_dates:
+                    next_earnings_date = earnings_dates[0]
+                    earnings_data.append({
+                        "Ticker": ticker,
+                        "Earnings Date": next_earnings_date.strftime('%Y-%m-%d')
+                    })
+                else:
+                    earnings_data.append({"Ticker": ticker, "Earnings Date": "N/A"})
+            else:
+                earnings_data.append({"Ticker": ticker, "Earnings Date": "N/A"})
+
+        except Exception as e:
+            # This will catch other potential errors during the API call
+            st.warning(f"Could not fetch earnings for {ticker}: {e}")
+            earnings_data.append({"Ticker": ticker, "Earnings Date": "Error"})
+
+    return pd.DataFrame(earnings_data)
+
+### NEW ###
+@st.cache_data
+def get_fred_series(series_id, _fred_client):
+    """
+    Fetches a single data series from FRED.
+    We pass the fred_client as an argument to make caching work, as the client object itself can't be cached.
+    """
+    try:
+        data = _fred_client.get_series(series_id)
+        return data.sort_index(ascending=False) # Sort to have the most recent data first
+    except Exception as e:
+        st.error(f"Failed to fetch data for series {series_id}: {e}")
+        return None
+
+@st.cache_data
+def get_dividend_dates(tickers):
+    """
+    Fetches the ex-dividend date for a list of stock tickers.
+    """
+    dividend_data = []
+    for ticker in tickers:
+        try:
+            stock = yf.Ticker(ticker)
+            ex_dividend_date_ts = stock.info.get('exDividendDate')
+            if ex_dividend_date_ts:
+                # Convert timestamp to a readable date
+                ex_dividend_date = datetime.fromtimestamp(ex_dividend_date_ts).strftime('%Y-%m-%d')
+                dividend_data.append({"Ticker": ticker, "Ex-Dividend Date": ex_dividend_date})
+            else:
+                dividend_data.append({"Ticker": ticker, "Ex-Dividend Date": "N/A"})
+
+        except Exception:
+             dividend_data.append({"Ticker": ticker, "Ex-Dividend Date": "Error"})
+    return pd.DataFrame(dividend_data)
+
+@st.cache_data
+def get_economic_events():
+    """
+    Fetches major economic events using the Financial Modeling Prep (FMP) API.
+    """
+    if not FMP_API_KEY or FMP_API_KEY == "your_fmp_api_key_here":
+        error_msg = "FMP API key not found. Please add it to your .env file."
+        return pd.DataFrame(), error_msg
+
+    try:
+        today = datetime.now().date()
+        end_date = today + timedelta(days=90)
+
+        date_from = today.strftime('%Y-%m-%d')
+        date_to = end_date.strftime('%Y-%m-%d')
+
+        url = f"https://financialmodelingprep.com/api/v3/economic_calendar?from={date_from}&to={date_to}&apikey={FMP_API_KEY}"
+
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+
+        if not data:
+            return pd.DataFrame(), "No economic events found in the upcoming schedule from FMP."
+
+        df = pd.DataFrame(data)
+        event_keywords = ['FOMC', 'CPI', 'Consumer Price Index']
+        mask = df['event'].str.contains('|'.join(event_keywords), case=False, na=False)
+        filtered_df = df[mask]
+
+        filtered_df = filtered_df[['event', 'date']].copy()
+        filtered_df.rename(columns={'event': 'Event', 'date': 'Date'}, inplace=True)
+
+        return filtered_df, None
+
+    except Exception as e:
+        error_msg = f"Could not fetch economic events from FMP. Error: {e}"
+        return pd.DataFrame(), error_msg
+
+
+@st.cache_data
+def get_stock_details(ticker):
+    """
+    Fetches detailed stock information from yfinance and caches the result.
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        return stock.info
+    except Exception as e:
+        st.warning(f"Could not fetch details for {ticker}: {e}")
+        return None
+
+@st.cache_data
+def run_backtest(ticker, start_date, end_date, initial_cash):
+    try:
+        price = vbt.YFData.download(ticker, start=start_date, end=end_date).get('Close')
+
+        if price.empty:
+            st.error("Could not download data for the given ticker and date range. Please try another ticker.")
+            return None, None
+
+        fast_ma = vbt.MA.run(price, 10, short_name='fast')
+        slow_ma = vbt.MA.run(price, 30, short_name='slow')
+
+        entries = fast_ma.ma_crossed_above(slow_ma)
+        exits = fast_ma.ma_crossed_below(slow_ma)
+
+        pf = vbt.Portfolio.from_signals(price, entries, exits, init_cash=initial_cash, freq='1D')
+
+        return pf.stats(), pf.plot()
+    except Exception as e:
+        st.error(f"An error occurred during the backtest: {e}")
+        return None, None
+
+def fetch_reddit_posts(ticker, subreddits=['wallstreetbets', 'stocks', 'investing'], limit=50):
+    """
+    Fetch Reddit posts containing stock ticker mentions
+    """
+    if not all([REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT]):
+        st.error("Reddit API credentials not configured. Please set REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, and REDDIT_USER_AGENT in your .env file.")
+        return pd.DataFrame()
+
+    try:
+        # Initialize Reddit instance
+        reddit = praw.Reddit(
+            client_id=REDDIT_CLIENT_ID,
+            client_secret=REDDIT_CLIENT_SECRET,
+            user_agent=REDDIT_USER_AGENT
+        )
+
+        posts = []
+        query = f'${ticker} OR {ticker}'
+
+        for subreddit in subreddits:
+            try:
+                # Search for posts in each subreddit
+                for submission in reddit.subreddit(subreddit).search(query, limit=limit, time_filter='month'):
+                    posts.append({
+                        'title': submission.title,
+                        'score': submission.score,
+                        'url': f'https://reddit.com{submission.permalink}',
+                        'comments': submission.num_comments,
+                        'created_utc': datetime.fromtimestamp(submission.created_utc),
+                        'subreddit': subreddit,
+                        'flair': submission.link_flair_text,
+                        'body': submission.selftext[:500] + "..." if len(submission.selftext) > 500 else submission.selftext
+                    })
+            except Exception as e:
+                st.warning(f"Error fetching from r/{subreddit}: {str(e)}")
+                continue
+
+        return pd.DataFrame(posts)
+    except Exception as e:
+        st.error(f"Error connecting to Reddit API: {e}")
+        return pd.DataFrame()
+
+def fetch_news(ticker):
+    """
+    Fetch news articles for a specific ticker using NewsAPI
+    """
+    if not NEWSAPI_KEY or NEWSAPI_KEY == "your_newsapi_key_here":
+        st.error("NewsAPI key not configured. Please set NEWSAPI_KEY in your .env file.")
+        return pd.DataFrame()
+
+    try:
+        # Calculate date range (last 30 days)
+        to_date = datetime.now().strftime('%Y-%m-%d')
+        from_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+
+        url = f"https://newsapi.org/v2/everything?q={ticker}&from={from_date}&to={to_date}&sortBy=publishedAt&language=en&apiKey={NEWSAPI_KEY}"
+
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+
+        if data['status'] != 'ok' or data['totalResults'] == 0:
+            st.info(f"No news articles found for {ticker}")
+            return pd.DataFrame()
+
+        articles = []
+        for article in data['articles']:
+            articles.append({
+                'title': article['title'],
+                'source': article['source']['name'],
+                'published_at': datetime.strptime(article['publishedAt'], '%Y-%m-%dT%H:%M:%SZ'),
+                'url': article['url'],
+                'description': article['description'][:200] + "..." if article['description'] and len(article['description']) > 200 else article['description']
+            })
+
+        return pd.DataFrame(articles)
+    except Exception as e:
+        st.error(f"Error fetching news: {e}")
+        return pd.DataFrame()
+
+def get_small_cap_stocks():
+    """
+    Uses Claude AI to get a list of US small and micro-cap stocks.
+    This replaces the Perplexity API call from the original version.
+    """
+    if not claude_client:
+        st.error("Claude API key is not set. Please add CLAUDE_API_KEY to your .env file.")
+        return []
+
+    try:
+        message = claude_client.messages.create(
+            model=MODEL_NAME,
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Please provide a list of 10 interesting US micro-cap or small-cap stock tickers. Just provide the tickers, separated by commas. No explanations, just the ticker symbols."
+                }
+            ],
+            system="You are a financial analyst that provides lists of stock tickers. Only return tickers separated by commas."
+        )
+
+        content = message.content[0].text
+        # Clean up the response to get only valid tickers
+        tickers = [ticker.strip().upper() for ticker in content.split(',') if ticker.strip()]
+        return tickers
+    except Exception as e:
+        st.error(f"Error fetching from Claude API: {e}")
+        return []
+
+def get_government_official_trades(ticker):
+    """
+    Uses the QuantiQ.live API to get trades done by House and Senate officials on the supplied ticker.
+    """
+    url = f"https://www.quantiq.live/api/get-congress-trades?simbol={ticker}"
+
+    payload = f"apiKey={QUANTIQ_API_KEY}"
+    headers = {
+        'Content-Type': 'application/x-www-form-urlencoded'
+    }
+
+    response = requests.request("POST", url, headers=headers, data=payload)
+    data = response.json()
+    try:
+        if 'data' in data and 'data' in data['data']:
+            data['data']['data'].pop('history', None)
+    except Exception as e:
+        # Silently fail if history key doesn't exist
+        pass
+
+    return data
+
+def plot_technicals(df, ticker):
+    """
+    Generates a professional financial chart with technical indicators using Plotly.
+    """
+    # 1. Create a figure with subplots
+    fig = go.Figure()
+    fig = make_subplots(
+        rows=4, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        subplot_titles=(f'{ticker} Price', 'Volume', 'RSI', 'MACD'),
+        row_heights=[0.5, 0.1, 0.2, 0.2] # Give more space to the main price chart
+    )
+
+    # 2. Add the Candlestick chart for price
+    fig.add_trace(go.Candlestick(
+        x=df.index,
+        open=df['open'],
+        high=df['high'],
+        low=df['low'],
+        close=df['close'],
+        name="Price"
+    ), row=1, col=1)
+
+    # 3. Add Overlays to the price chart (Moving Averages & Bollinger Bands)
+    fig.add_trace(go.Scatter(x=df.index, y=df['SMA_20'], mode='lines', name='SMA 20', line=dict(color='yellow', width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_50'], mode='lines', name='EMA 50', line=dict(color='purple', width=1)), row=1, col=1)
+    # Bollinger Bands
+    fig.add_trace(go.Scatter(x=df.index, y=df['BBU_20_2.0'], mode='lines', name='Upper BB', line=dict(color='cyan', width=1, dash='dash')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['BBL_20_2.0'], mode='lines', name='Lower BB', line=dict(color='cyan', width=1, dash='dash'), fill='tonexty', fillcolor='rgba(0, 176, 246, 0.1)'), row=1, col=1)
+
+    # 4. Add the Volume chart
+    # Color bars red for down days and green for up days
+    colors = ['green' if row['close'] >= row['open'] else 'red' for index, row in df.iterrows()]
+    fig.add_trace(go.Bar(x=df.index, y=df['volume'], name='Volume', marker_color=colors), row=2, col=1)
+
+    # 5. Add the RSI chart
+    fig.add_trace(go.Scatter(x=df.index, y=df['RSI_14'], mode='lines', name='RSI', line=dict(color='orange', width=2)), row=3, col=1)
+    # Add overbought/oversold lines for RSI
+    fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
+    fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
+
+    # 6. Add the MACD chart
+    fig.add_trace(go.Scatter(x=df.index, y=df['MACD_12_26_9'], mode='lines', name='MACD', line=dict(color='blue', width=2)), row=4, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['MACDs_12_26_9'], mode='lines', name='Signal', line=dict(color='red', width=1)), row=4, col=1)
+    # Color histogram based on positive or negative values
+    macd_colors = ['green' if val >= 0 else 'red' for val in df['MACDh_12_26_9']]
+    fig.add_trace(go.Bar(x=df.index, y=df['MACDh_12_26_9'], name='Histogram', marker_color=macd_colors), row=4, col=1)
+
+    # 7. Update the layout for a clean look
+    fig.update_layout(
+        title=f'{ticker} Technical Analysis',
+        height=800,
+        showlegend=True,
+        xaxis_rangeslider_visible=False, # Hide the main range slider
+        template='plotly_dark' # Use a dark theme
+    )
+    # Hide the range slider for all but the last subplot
+    fig.update_xaxes(rangeslider_visible=False)
+
+    return fig
+
+def get_financials(ticker):
+    """
+    Fetches financial data for a given stock ticker using the Quantiq API.
+    """
+    url = f"https://www.quantiq.live/api/get-market-data/{ticker}"
+
+    payload = f"apiKey={QUANTIQ_API_KEY}"
+    headers = {
+        'Content-Type': 'application/x-www-form-urlencoded'
+    }
+
+    response = requests.request("POST", url, headers=headers, data=payload)
+    data = response.json()
+    try:
+        if 'data' in data and 'data' in data['data']:
+            data['data']['data'].pop('history', None)
+    except Exception as e:
+        # Silently fail if history key doesn't exist
+        pass
+
+    return data
+
+def get_technicals(ticker):
+    """
+    Fetches technical indicators for a given stock ticker using yfinance.
+    """
+    try:
+        url = f"https://www.quantiq.live/api/technical-indicator?symbol={ticker}&timeframe=1Day&period=100"
+        payload = f"apiKey={QUANTIQ_API_KEY}"
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
+
+        response = requests.request("POST", url, headers=headers, data=payload)
+        data = response.json()
+
+        if 'bars' not in data or not data['bars']:
+            st.warning(f"No bar data returned for {ticker} from the API.")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data['bars'])
+
+        df.rename(columns={
+            'ClosePrice': 'close',
+            'HighPrice': 'high',
+            'LowPrice': 'low',
+            'OpenPrice': 'open',
+            'Volume': 'volume',
+            'Timestamp': 'timestamp'
+        }, inplace=True)
+
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df.set_index('timestamp', inplace=True)
+
+        df.sort_index(inplace=True)
+
+        my_strategy = ta.Strategy(
+            name="Common Indicators",
+            description="SMA, EMA, RSI, and Bollinger Bands",
+            ta=[
+                {"kind": "sma", "length": 20},
+                {"kind": "ema", "length": 50},
+                {"kind": "rsi"},
+                {"kind": "bbands", "length": 20, "std": 2},
+                {"kind": "macd"},
+            ]
+        )
+
+        df.ta.strategy(my_strategy)
+
+        return df
+
+
+    except Exception as e:
+        st.error(f"Error fetching technicals for {ticker}: {e}")
+        return pd.DataFrame()
+
+def get_stock_recommendation(ticker, financials):
+    """
+    Uses Claude to get a buy, sell, or short-sell recommendation for a stock.
+    """
+    if not claude_client:
+        st.error("Claude API key is not set. Please add CLAUDE_API_KEY to your .env file.")
+        return "Error"
+
+    try:
+        message = claude_client.messages.create(
+            model=MODEL_NAME,
+            max_tokens=500,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Should I invest in {ticker}? The financials are as follows: {financials}. Provide a 'BUY' or 'SELL' recommendation and a brief, one-sentence justification. Start your response with one of the keywords: BUY or SELL."
+                }
+            ],
+            system="You are a financial analyst. Provide a 'BUY' or 'SELL' recommendation for the given stock ticker and a brief, one-sentence justification. Start your response with one of the keywords: BUY or SELL."
+        )
+        return message.content[0].text
+    except Exception as e:
+        st.error(f"Error getting recommendation from Claude: {e}")
+        return "Error"
+
+def get_auto_stock_recommendation(ticker, financials, socials, news, government_trades, polymarket_data):
+    """
+    Uses Claude to get a buy, sell, or short-sell recommendation for a stock using multiple data sources.
+    """
+    if not claude_client:
+        st.error("Claude API key is not set. Please add CLAUDE_API_KEY to your .env file.")
+        return "Error"
+
+    try:
+        message = claude_client.messages.create(
+            model=MODEL_NAME,
+            max_tokens=500,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Should I invest in {ticker}? The financials are as follows: {financials}. "
+                               f"Here are some news about this stock: {news} and the latest posts on Reddit: {socials}. "
+                               f"Here are also government trades related to this stock: {government_trades}. "
+                               f"Crucially, here is data from the Polymarket prediction market, which reflects crowd-sourced probabilities on future events: {polymarket_data}. "
+                               f"Based on ALL of this information, provide a 'BUY' or 'SELL' recommendation and a brief, one-sentence justification. Start your response with one of the keywords: BUY or SELL."
+                }
+            ],
+            system="You are a financial analyst. Provide a 'BUY' or 'SELL' recommendation for the given stock ticker and a brief, one-sentence justification. Start your response with one of the keywords: BUY or SELL."
+        )
+        return message.content[0].text
+    except Exception as e:
+        st.error(f"Error getting recommendation from Claude: {e}")
+        return "Error"
+
+def hedge_portfolio():
+    """
+    Analyzes the current portfolio, gets a hedge proposal from Claude,
+    and returns the proposal as a dictionary. It can handle various listed assets.
+    """
+    if not claude_client:
+        return {"error": "Claude API key is not set. Please add CLAUDE_API_KEY to your .env file."}
+
+    # 1. Load and validate the current portfolio.
+    if not os.path.exists(PORTFOLIO_CSV):
+        return {"error": "Your portfolio is empty. Add some stocks before hedging."}
+
+    portfolio_df = pd.read_csv(PORTFOLIO_CSV)
+    if portfolio_df.empty:
+        return {"error": "Your portfolio is empty. Add some stocks before hedging."}
+
+    # Calculate current holdings, considering only positive positions (longs).
+    holdings = portfolio_df.groupby('ticker')['shares'].apply(
+        lambda x: x[portfolio_df.loc[x.index, 'action'] != 'SELL'].sum() - x[portfolio_df.loc[x.index, 'action'] == 'SELL'].sum()
+    ).to_dict()
+
+    current_positions = {ticker: shares for ticker, shares in holdings.items() if shares > 0}
+
+    if not current_positions:
+        return {"error": "You have no open long positions to hedge."}
+
+    holdings_str = ", ".join([f"{shares} shares of {ticker}" for ticker, shares in current_positions.items()])
+
+    # 2. Construct prompt and call Claude for a hedging strategy.
+    try:
+        prompt_content = f"""
+        Given the following equity portfolio: {holdings_str}.
+        Propose a single, specific, and listed asset to act as a hedge. This could be a commodity ETF (e.g., for gold GLD, oil USO), a cryptocurrency (e.g., BTC-USD), REITs, Bonds or a volatility-based product (e.g., VIXY).
+        The goal is to find an asset that is likely to have a negative correlation with the provided portfolio, especially during market downturns.
+        Return your answer in the following strict format, and nothing else:
+        BUY: [TICKER], JUSTIFICATION: [Your brief one-sentence justification here.]
+        """
+
+        message = claude_client.messages.create(
+            model=MODEL_NAME,
+            max_tokens=200,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt_content
+                }
+            ],
+            system="You are an expert hedge fund analyst. You provide concise, actionable hedging strategies in a specific format."
+        )
+        proposal = message.content[0].text.strip()
+
+        # 3. Parse the proposal from the AI's response.
+        if "BUY:" in proposal.upper() and "JUSTIFICATION:" in proposal.upper():
+            # Use split and strip for robust, case-insensitive parsing.
+            parts = proposal.split("JUSTIFICATION:")
+            ticker = parts[0].replace("BUY:", "").strip()
+            justification = parts[1].strip()
+
+            return {
+                "ticker": ticker,
+                "justification": justification
+            }
+        else:
+            return {"error": f"Failed to parse the hedge proposal from the AI. Raw response: {proposal}"}
+
+    except Exception as e:
+        return {"error": f"An error occurred while communicating with Claude: {e}"}
+
+def generate_google_trends_queries(ticker, company_name):
+    """Uses Claude to generate relevant search queries for Google Trends."""
+    if not claude_client:
+        st.error("Claude API key is not set. Please add CLAUDE_API_KEY to your .env file.")
+        return []
+
+    prompt = f"""
+    Act as a financial analyst. For the company {company_name} ({ticker}), generate exactly 5 distinct Google search queries that could act as leading indicators for stock price movements.
+    Include a mix of bullish and bearish terms covering topics like products, scandals, financial health, and public interest.
+    Return the list as a simple comma-separated string, and nothing else.
+    Example: Tesla recall, Cybertruck release date, Elon Musk lawsuit, Tesla stock forecast, Model 3 sales
+    """
+    try:
+        message = claude_client.messages.create(
+            model=MODEL_NAME,
+            max_tokens=200,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            system="You are a helpful financial analyst assistant."
+        )
+        query_string = message.content[0].text
+        queries = [q.strip() for q in query_string.split(',')]
+        return queries
+    except Exception as e:
+        st.error(f"Error calling Claude API for trend queries: {e}")
+        return []
+
+def get_google_trends_data(queries, timeframe='today 3-m'):
+    """Fetches Google Trends data for a list of queries."""
+    if not queries:
+        return None
+    pytrends = TrendReq(hl='en-US', tz=360)
+    try:
+        pytrends.build_payload(kw_list=queries, timeframe=timeframe)
+        trends_df = pytrends.interest_over_time()
+        if trends_df.empty:
+            return None
+        return trends_df.drop(columns=['isPartial'])
+    except Exception as e:
+        if "429" in str(e):
+            st.error("Google Trends is rate-limiting our requests. Please wait a minute before trying again.")
+            print(e)
+        else:
+            st.error(f"Error fetching Google Trends data: {e}")
+        return None
+
+def plot_google_trends(df, ticker):
+    """Generates an interactive plot for Google Trends data using Plotly."""
+    fig = go.Figure()
+    for col in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df[col], mode='lines', name=col))
+    fig.update_layout(
+        title=f'Google Search Trend Interest for {ticker}',
+        height=500,
+        template='plotly_dark',
+        yaxis_title='Relative Search Interest (0-100)',
+        legend_title_text='Search Queries'
+    )
+    return fig
+
+
+def update_portfolio(ticker, action, shares, price):
+    """
+    Updates the portfolio CSV file with a new transaction.
+    """
+    new_trade = pd.DataFrame([{
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "ticker": ticker,
+        "action": action.upper(),
+        "shares": shares,
+        "price": price
+    }])
+    if os.path.exists(PORTFOLIO_CSV):
+        portfolio_df = pd.read_csv(PORTFOLIO_CSV)
+        portfolio_df = pd.concat([portfolio_df, new_trade], ignore_index=True)
+    else:
+        portfolio_df = new_trade
+    portfolio_df.to_csv(PORTFOLIO_CSV, index=False)
+
+def book_trade_alpaca(api, ticker, shares, action, stop_loss=None, take_profit=None):
+    """
+    Books a trade through the Alpaca API. If stop_loss and take_profit are provided
+    for a BUY order, it creates a bracket order. Otherwise, a simple market order.
+    Returns (success_boolean, message_or_order_object).
+    """
+    if not api:
+        return False, "Alpaca API client is not initialized. Check your API keys."
+
+    if action.upper() in ["BUY"]:
+        side = 'buy'
+    elif action.upper() in ["SELL", "SHORT"]:
+        side = 'sell'
+    else:
+        return False, f"Invalid action: {action}"
+
+    # Base order parameters
+    order_data = {
+        'symbol': ticker,
+        'qty': shares,
+        'side': side,
+        'type': 'market',
+        'time_in_force': 'day'
+    }
+
+    is_buy = action.upper() == "BUY"
+    has_stop = stop_loss is not None and float(stop_loss) > 0
+    has_profit = take_profit is not None and float(take_profit) > 0
+
+    if is_buy and has_stop and has_profit:
+        order_data['order_class'] = 'bracket'
+        order_data['stop_loss'] = {'stop_price': str(stop_loss)}
+        order_data['take_profit'] = {'limit_price': str(take_profit)}
+        st.info("Submitting a bracket order with stop-loss and take-profit.")
+    elif is_buy and (has_stop or has_profit):
+        st.warning("To create a bracket order, both a valid stop-loss AND take-profit price must be provided. Submitting a simple market order instead.")
+
+    try:
+        order = api.submit_order(**order_data)
+        return True, order
+    except Exception as e:
+        return False, str(e)
+
+def get_current_price(ticker):
+    """
+    Gets the current price of an asset (stock, crypto, ETF, etc.) using yfinance.
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        price = info.get('bid') or info.get('regularMarketPrice')
+        if price:
+            return price
+        price = stock.history(period="1d")['Close'].iloc[-1]
+        return price
+    except Exception as e:
+        st.warning(f"Could not fetch price for {ticker}: {e}")
+        return None
+
+# --- Streamlit App ---
+
+st.set_page_config(page_title="AI Stock Picker (Claude)", layout="wide")
+st.title("AI-Powered Stock Picking Assistant (Claude Edition)")
+
+# Show which LLM is being used
+st.markdown("**🤖 Powered by Claude Sonnet 4.5**")
+
+if ALPACA_API_KEY and ALPACA_SECRET_KEY and "YOUR" not in ALPACA_API_KEY:
+    try:
+        base_url = "https://paper-api.alpaca.markets" if ALPACA_PAPER else "https://api.alpaca.markets"
+        alpaca_api = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, base_url, api_version='v2')
+        account = alpaca_api.get_account()
+        st.sidebar.success(f"✅ Alpaca Connected ({'Paper' if ALPACA_PAPER else 'Live'})")
+    except Exception as e:
+        st.sidebar.error(f"⚠️ Alpaca connection failed: {e}")
+else:
+    st.sidebar.warning("🔑 Alpaca keys not found. Trade booking is disabled.")
+    alpaca_api = None
+
+# --- Initialize Session State ---
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "actionable_recommendation" not in st.session_state:
+    st.session_state.actionable_recommendation = None
+
+# --- Page Navigation ---
+page = st.sidebar.radio("Navigate", ["Chat", "Portfolio Performance", "Backtesting Engine", "Event Calendar", "Macro Indicators"])
+
+if "technicals_data" not in st.session_state:
+    st.session_state.technicals_data = None
+
+if "trends_data" not in st.session_state:
+    st.session_state.trends_data = None
+
+if page == "Chat":
+    st.header("Chat with your AI Analyst (Claude)")
+
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if rec := st.session_state.actionable_recommendation:
+        ticker = rec["ticker"]
+        action = rec["action"]
+
+        with st.container():
+            st.info(f"Click the button below to execute the trade for {ticker}. You can adjust the number of shares before executing.")
+            shares_to_trade = st.number_input(
+                label="Number of Shares",
+                min_value=1,
+                value=10,
+                step=1,
+                key=f"shares_{ticker}_{action}"
+            )
+
+            stop_loss_price = None
+            take_profit_price = None
+
+            if action.upper() == "BUY":
+                st.markdown("---")
+                st.markdown("##### Optional: Add Stop-Loss & Take-Profit (Bracket Order)")
+                col1, col2 = st.columns(2)
+                with col1:
+                    stop_loss_price = st.number_input(
+                        label="Stop-Loss Price",
+                        min_value=0.0,
+                        value=0.0,
+                        step=0.01,
+                        format="%.2f",
+                        key=f"stop_loss_{ticker}",
+                        help="The price to trigger a sell order to limit losses. Set BOTH SL and TP to create a bracket order."
+                    )
+                with col2:
+                    take_profit_price = st.number_input(
+                        label="Take-Profit Price",
+                        min_value=0.0,
+                        value=0.0,
+                        step=0.01,
+                        format="%.2f",
+                        key=f"take_profit_{ticker}",
+                        help="The limit price to trigger a sell order to lock in profits. Set BOTH SL and TP to create a bracket order."
+                    )
+
+            if st.button(f"Execute {action} for {ticker}", key=f"execute_{ticker}_{action}"):
+                with st.spinner(f"Executing {action} for {ticker}..."):
+                    success, message = book_trade_alpaca(
+                        alpaca_api,
+                        ticker,
+                        shares_to_trade,
+                        action,
+                        stop_loss=stop_loss_price,
+                        take_profit=take_profit_price
+                    )
+
+                    if success:
+                        order_details = message
+                        price_for_log = get_current_price(ticker)
+                        if price_for_log:
+                            update_portfolio(ticker, action, shares_to_trade, price_for_log)
+                            success_msg = f"✅ **Alpaca trade submitted!** {action} {shares_to_trade} shares of {ticker}. Order ID: `{order_details.id}`."
+                            st.success(success_msg)
+                            st.session_state.messages.append({"role": "assistant", "content": success_msg})
+                        else:
+                            st.error("Alpaca order submitted, but failed to fetch price for local portfolio log.")
+                    else:
+                        error_msg = f"❌ **Alpaca trade failed:** {message}"
+                        st.error(error_msg)
+                        st.session_state.messages.append({"role": "assistant", "content": error_msg})
+
+                st.session_state.actionable_recommendation = None
+                st.rerun() # Rerun to update the UI immediately
+
+    if st.session_state.get('trends_data') is not None:
+        ticker = st.session_state.trends_data["ticker"]
+        trends_df = st.session_state.trends_data["data"]
+        st.info(f"Displaying Google Trends analysis for {ticker}. This chart will remain until you request a new one.")
+        fig = plot_google_trends(trends_df, ticker)
+        st.plotly_chart(fig, use_container_width=True)
+        if st.button("Clear Google Trends Chart", key="clear_trends"):
+            st.session_state.trends_data = None
+            st.rerun()
+
+    if st.session_state.get('technicals_data') is not None:
+        ticker = st.session_state.technicals_data["ticker"]
+        technicals_df = st.session_state.technicals_data["data"]
+
+        if technicals_df is not None and not technicals_df.empty:
+            st.info(f"Displaying technical analysis for {ticker}. This chart will remain until you request a new one.")
+            fig = plot_technicals(technicals_df, ticker)
+
+            st.plotly_chart(fig, use_container_width=True)
+            if st.button("Clear Technicals Chart", key="clear_technicals"):
+                st.session_state.technicals_data = None
+                st.rerun()
+        else:
+             st.session_state.technicals_data = None # Clear if data was empty
+
+    # --- Chat Input Logic ---
+    if prompt := st.chat_input("What would you like to do? (e.g., 'find stocks', 'analyze AAPL', 'hedge portfolio', 'get technicals MSFT', 'get trends TSLA', 'get news GME', 'get social sentiment AMZN')"):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                response_content = ""
+                st.session_state.actionable_recommendation = None
+                prompt_lower = prompt.lower()
+                if "find stocks" in prompt.lower():
+                    tickers = get_small_cap_stocks()
+                    if tickers:
+                        response_content = f"Here are some small-cap stocks I found: {', '.join(tickers)}"
+                    else:
+                        response_content = "Sorry, I couldn't fetch any stock tickers at the moment."
+                elif "check house and senate trades" in prompt.lower():
+                    ticker = prompt.split(" ")[-1].upper()
+                    response = get_government_official_trades(ticker)
+                    if response:
+                        response_content = f"Here are some recent trades by House and Senate officials on {ticker}:\n\n{response}"
+                    else:
+                        response_content = f"Sorry, I couldn't find any trades for {ticker}."
+
+                elif "analyze" in prompt.lower():
+                    ticker = prompt.split(" ")[-1].upper()
+                    financials = get_financials(ticker)
+                    recommendation = get_stock_recommendation(ticker, financials)
+                    response_content = recommendation
+
+                    rec_upper = recommendation.upper()
+                    if rec_upper.startswith("BUY") or rec_upper.startswith("SHORT"):
+                        action = "BUY" if rec_upper.startswith("BUY") else "SHORT"
+                        st.session_state.actionable_recommendation = {"ticker": ticker, "action": action}
+
+                elif "enable auto-pilot" in prompt.lower():
+                    try:
+                        positions = alpaca_api.list_positions()
+                        current_positions = {position.symbol: float(position.qty) for position in positions}
+                        account = alpaca_api.get_account()
+                        cash_available = float(account.cash)
+                        st.info(f"Available cash: ${cash_available:,.2f}")
+                    except Exception as e:
+                        st.error(f"Error fetching positions from Alpaca: {e}")
+                        current_positions = {}
+                        cash_available = 0
+
+                    responses = []
+
+                    tickers = get_small_cap_stocks()
+                    if not tickers:
+                        response_content = "Sorry, I couldn't fetch any stock tickers for auto-pilot."
+                    else:
+                        for ticker in tickers:
+                            financials = {}
+                            try:
+                                financials = get_financials(ticker)
+                            except Exception as e:
+                                financials = get_financials(ticker)
+                            social_data = fetch_reddit_posts(ticker)
+                            news_data = fetch_news(get_company_name(ticker))
+                            government_trades = get_government_official_trades(ticker)
+                            st.write(f"🔍 Searching Polymarket for predictions related to **{ticker}**...")
+                            polymarket_data = get_polymarket_odds(ticker)
+                            st.info(f"**Polymarket Insights:** {polymarket_data}")
+                            recommendation = get_auto_stock_recommendation(ticker, financials, social_data.to_dict('records'), news_data.to_dict('records'), government_trades, polymarket_data)
+                            responses.append(f"**{ticker}**: {recommendation}")
+
+                            rec_upper = recommendation.upper()
+                            if rec_upper.startswith("BUY"):
+                                if ticker not in current_positions or current_positions[ticker] == 0:
+                                    current_price = get_current_price(ticker)
+
+                                    if current_price:
+                                    # Allocate 10% of available cash to each position
+                                        position_value = cash_available * 0.1
+                                        shares_to_buy = max(1, int(position_value / current_price))
+                                        responses.append(f"Buying {shares_to_buy} shares of {ticker} at ${current_price:.2f}")
+
+                                        book_trade_alpaca(
+                                            alpaca_api,
+                                            ticker,
+                                            shares=shares_to_buy,
+                                            action="BUY"
+                                        )
+                                        update_portfolio(ticker, "BUY", shares_to_buy, current_price)
+                                    else:
+                                        responses.append(f"Could not get current price for {ticker}, skipping buy")
+
+                        for ticker, quantity in current_positions.items():
+                            if quantity > 0:
+                                financial_data = get_financials(ticker)
+                                recommendation = get_stock_recommendation(ticker, financial_data)
+                                responses.append(f"**{ticker}**: {recommendation}")
+
+                                rec_upper = recommendation.upper()
+                                if rec_upper.startswith("SELL"):
+
+                                    book_trade_alpaca(
+                                        alpaca_api,
+                                        ticker,
+                                        shares=quantity,
+                                        action="SELL"
+                                    )
+                                    update_portfolio(ticker, "SELL", quantity, get_current_price(ticker) or 0)
+
+                        response_content = "Auto-pilot analysis completed:\n\n" + "\n\n".join(responses)
+
+                    st.session_state.messages.append({"role": "assistant", "content": response_content})
+
+                elif "get technicals" in prompt.lower():
+                    ticker = prompt.split(" ")[-1].upper()
+                    st.info(f"Fetching technical data for {ticker}...")
+
+                    technicals_df = get_technicals(ticker)
+
+                    if not technicals_df.empty:
+                        st.session_state.technicals_data = {"ticker": ticker, "data": technicals_df}
+                        response_content = f"I've fetched the technical data for {ticker}. The chart is now displayed above."
+
+                    else:
+                        response_content = f"Sorry, I couldn't fetch technical data for {ticker}."
+                        st.session_state.technicals_data = None # Clear any old chart
+
+                elif "trend" in prompt_lower:
+                    ticker = prompt.split(" ")[-1].upper()
+                    st.info(f"Fetching Google Trends data for {ticker}...")
+                    company_name = get_company_name(ticker)
+                    queries = generate_google_trends_queries(ticker, company_name)
+                    if queries:
+                        trends_df = get_google_trends_data(queries)
+                        if trends_df is not None and not trends_df.empty:
+                            st.session_state.trends_data = {"ticker": ticker, "data": trends_df}
+                            response_content = f"I've fetched the Google Trends data for {ticker}. The chart is now displayed above."
+                        else:
+                            response_content = f"Sorry, I couldn't fetch Google Trends data for {ticker}. The search terms might have low volume."
+                            st.session_state.trends_data = None
+                    else:
+                        response_content = f"Sorry, I couldn't generate search queries for {ticker}."
+
+                elif "sell" in prompt_lower:
+                    ticker_to_sell = prompt.split(" ")[-1].upper()
+                    if os.path.exists(PORTFOLIO_CSV):
+                        portfolio_df = pd.read_csv(PORTFOLIO_CSV)
+                        if ticker_to_sell in portfolio_df['ticker'].values:
+                            response_content = f"You have a position in {ticker_to_sell}. Do you want to sell?"
+                            st.session_state.actionable_recommendation = {"ticker": ticker_to_sell, "action": "SELL"}
+                        else:
+                            response_content = f"You do not own {ticker_to_sell}."
+                    else:
+                        response_content = "Your portfolio is empty."
+
+                elif "hedge" in prompt_lower:
+                    hedge_result = hedge_portfolio()
+                    if "error" in hedge_result:
+                        response_content = hedge_result["error"]
+                    else:
+                        ticker = hedge_result['ticker']
+                        justification = hedge_result['justification']
+                        response_content = f"🛡️ **Hedge Proposal:** To hedge your portfolio, I recommend buying **{ticker}**. \n\n*Justification:* {justification}"
+
+                        st.session_state.actionable_recommendation = {"ticker": ticker, "action": "BUY"}
+
+                elif "get news" in prompt_lower:
+                    ticker = prompt.split(" ")[-1].upper()
+                    st.info(f"Fetching news for {ticker}...")
+
+                    news_df = fetch_news(ticker)
+
+                    if not news_df.empty:
+                        response_content = f"Here are the latest news articles for {ticker}:"
+
+                        for _, article in news_df.head(5).iterrows():
+                            response_content += f"\n\n- **{article['title']}** ({article['source']})"
+                            response_content += f"\n  {article['published_at'].strftime('%Y-%m-%d')}"
+                            if article['description']:
+                                response_content += f"\n  {article['description']}"
+                            response_content += f"\n  [Read more]({article['url']})"
+
+                        st.session_state.news_data = {"ticker": ticker, "data": news_df}
+                    else:
+                        response_content = f"Sorry, I couldn't find any news articles for {ticker}."
+
+                elif "get social sentiment" in prompt_lower:
+                    ticker = prompt.split(" ")[-1].upper()
+                    st.info(f"Fetching Reddit posts about {ticker}...")
+
+                    reddit_df = fetch_reddit_posts(ticker)
+
+                    if not reddit_df.empty:
+                        response_content = f"Here are recent Reddit posts about {ticker}:"
+
+                        for _, post in reddit_df.head(5).iterrows():
+                            response_content += f"\n\n- **{post['title']}** (r/{post['subreddit']}, 👍{post['score']})"
+                            response_content += f"\n  {post['created_utc'].strftime('%Y-%m-%d')}"
+                            if post['body']:
+                                response_content += f"\n  {post['body']}"
+                            response_content += f"\n  [View post]({post['url']})"
+
+
+                        st.session_state.reddit_data = {"ticker": ticker, "data": reddit_df}
+                    else:
+                        response_content = f"Sorry, I couldn't find any Reddit posts about {ticker}."
+
+                    if st.session_state.get('news_data') is not None:
+                        ticker = st.session_state.news_data["ticker"]
+                        news_df = st.session_state.news_data["data"]
+
+                        st.info(f"Displaying news for {ticker}. This will remain until you request new news.")
+                        st.dataframe(
+                            news_df[['title', 'source', 'published_at', 'url']],
+                            column_config={
+                                "title": "Title",
+                                "source": "Source",
+                                "published_at": "Published",
+                                "url": st.column_config.LinkColumn("URL")
+                            },
+                            hide_index=True,
+                            use_container_width=True
+                        )
+
+                        if st.button("Clear News", key="clear_news"):
+                            st.session_state.news_data = None
+                            st.rerun()
+
+                    if st.session_state.get('reddit_data') is not None:
+                        ticker = st.session_state.reddit_data["ticker"]
+                        reddit_df = st.session_state.reddit_data["data"]
+
+                        st.info(f"Displaying Reddit posts about {ticker}. This will remain until you request new social sentiment.")
+                        st.dataframe(
+                            reddit_df[['title', 'subreddit', 'score', 'comments', 'created_utc', 'url']],
+                            column_config={
+                                "title": "Title",
+                                "subreddit": "Subreddit",
+                                "score": "Upvotes",
+                                "comments": "Comments",
+                                "created_utc": "Posted",
+                                "url": st.column_config.LinkColumn("URL")
+                            },
+                            hide_index=True,
+                            use_container_width=True
+                        )
+
+                        if st.button("Clear Reddit Posts", key="clear_reddit"):
+                            st.session_state.reddit_data = None
+                            st.rerun()
+
+                else:
+                    response_content = "I can help you find stocks, analyze them, hedge your portfolio, or sell positions. What would you like to do?"
+
+                st.markdown(response_content)
+
+        st.session_state.messages.append({"role": "assistant", "content": response_content})
+        st.rerun() # Rerun to display the new button if one was set
+
+elif page == "Portfolio Performance":
+    st.header("Portfolio Performance")
+
+    if not os.path.exists(PORTFOLIO_CSV):
+        st.warning("No portfolio data found. Make some trades in the 'Chat' page.")
+    else:
+        portfolio_df = pd.read_csv(PORTFOLIO_CSV)
+        st.subheader("Trade History")
+        st.dataframe(portfolio_df)
+
+        # Calculate current holdings
+        holdings = portfolio_df.groupby('ticker')['shares'].apply(
+            lambda x: x[portfolio_df.loc[x.index, 'action'] != 'SELL'].sum() - x[portfolio_df.loc[x.index, 'action'] == 'SELL'].sum()
+        ).to_dict()
+
+        # Display current holdings and performance
+        performance_data = []
+        heatmap_data = []
+        total_value = 0
+        total_cost_basis_overall = 0
+        total_pnl_overall = 0
+
+        for ticker, shares in holdings.items():
+            if shares > 0:
+                current_price = get_current_price(ticker)
+                if current_price:
+                    value = shares * current_price
+                    total_value += value
+                    stock_details = get_stock_details(ticker)
+                    sector = stock_details.get('sector', 'N/A') if stock_details else 'N/A'
+
+                    # Add data for the heatmap/treemap
+                    heatmap_data.append({
+                        "Ticker": ticker,
+                        "Sector": sector,
+                        "Market Value": value
+                    })
+
+                    # Improved Gain/Loss Calculation
+                    buy_trades = portfolio_df[(portfolio_df['ticker'] == ticker) & (portfolio_df['action'] != 'SELL')]
+                    sell_trades = portfolio_df[(portfolio_df['ticker'] == ticker) & (portfolio_df['action'] == 'SELL')]
+
+                    cost_basis = 0
+                    if not buy_trades.empty:
+                        total_cost_of_buys = (buy_trades['shares'] * buy_trades['price']).sum()
+                        total_shares_bought = buy_trades['shares'].sum()
+                        avg_buy_price = total_cost_of_buys / total_shares_bought if total_shares_bought > 0 else 0
+                        cost_basis = shares * avg_buy_price
+                        gain_loss = value - cost_basis
+
+                        total_cost_basis_overall += cost_basis
+                        total_pnl_overall += gain_loss
+
+                    performance_data.append({
+                        "Ticker": ticker, "Shares": shares,
+                        "Current Price": f"${current_price:,.2f}",
+                        "Current Value": f"${value:,.2f}",
+                        "Gain/Loss": f"${gain_loss:,.2f}"
+                    })
+
+        st.subheader("Current Holdings")
+        if performance_data:
+            performance_df = pd.DataFrame(performance_data)
+            st.dataframe(performance_df)
+        else:
+            st.info("You currently have no open positions.")
+
+        st.markdown("---") # Adds a horizontal line for visual separation
+
+        # --- Overall Performance Metrics ---
+        st.subheader("Overall Portfolio Performance")
+
+        percentage_pnl = (total_pnl_overall / total_cost_basis_overall * 100) if total_cost_basis_overall > 0 else 0
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric(
+            label="Total Portfolio Value 💰",
+            value=f"${total_value:,.2f}"
+        )
+        col2.metric(
+            label="Total Gain / Loss 📈",
+            value=f"${total_pnl_overall:,.2f}",
+            delta=f"{percentage_pnl:.2f}%"
+        )
+        col3.metric(
+            label="Total Cost Basis 🏦",
+            value=f"${total_cost_basis_overall:,.2f}"
+        )
+        st.markdown("---")
+
+        all_tickers = portfolio_df['ticker'].unique().tolist()
+        if all_tickers:
+            start_date = pd.to_datetime(portfolio_df['date']).min()
+            end_date = datetime.now()
+
+            st.subheader("Individual Asset Price Evolution")
+            with st.spinner("Loading historical price data for charts..."):
+                try:
+                    historical_data = yf.download(all_tickers, start=start_date, end=end_date, progress=False)
+                    if not historical_data.empty:
+                        adj_close_prices = historical_data['Close']
+                        if isinstance(adj_close_prices, pd.Series):
+                            adj_close_prices = adj_close_prices.to_frame(name=all_tickers[0])
+
+                        st.line_chart(adj_close_prices.dropna(axis=1, how='all'))
+                    else:
+                        st.warning("Could not retrieve historical price data for charting.")
+                except Exception as e:
+                    st.error(f"An error occurred while fetching historical data for charts: {e}")
+
+        st.subheader("Portfolio Concentration")
+        if heatmap_data:
+            heatmap_df = pd.DataFrame(heatmap_data)
+            # Create a treemap for visualization
+            fig = px.treemap(heatmap_df,
+                             path=[px.Constant("All Stocks"), 'Sector', 'Ticker'],
+                             values='Market Value',
+                             color='Sector',
+                             hover_data={'Market Value': ':.2f'},
+                             title='Portfolio Concentration by Sector and Ticker')
+
+            fig.update_layout(
+                margin=dict(t=50, l=25, r=25, b=25),
+                template='plotly_dark'
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No holdings to display in the concentration map.")
+
+elif page == "Backtesting Engine":
+    st.header("Backtesting Engine")
+    st.markdown("""
+    This engine simulates a trading strategy on historical data to evaluate its performance.
+    As a placeholder for a dynamic AI recommendation, we are using a simple **Simple Moving Average (SMA) Crossover** strategy:
+    - **Buy Signal**: When the fast-moving average (10-day) crosses above the slow-moving average (30-day).
+    - **Sell Signal**: When the fast-moving average crosses below the slow-moving average.
+    """)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        ticker = st.text_input("Ticker Symbol", value="AAPL")
+        start_date = st.date_input("Start Date", value=date(2022, 1, 1))
+    with col2:
+        initial_cash = st.number_input("Initial Cash", min_value=1000, value=10000, step=1000)
+        end_date = st.date_input("End Date", value=date.today())
+
+    if st.button("Run Backtest"):
+        with st.spinner("Running backtest... This may take a moment."):
+            stats, plot_fig = run_backtest(ticker, str(start_date), str(end_date), initial_cash)
+
+            if stats is not None:
+                st.subheader("Backtest Results")
+
+                st.markdown("---")
+                cols = st.columns(4)
+                cols[0].metric("Total Return [%]", f"{stats['Total Return [%]']:.2f}")
+                cols[1].metric("Max Drawdown [%]", f"{stats['Max Drawdown [%]']:.2f}")
+                cols[2].metric("Sharpe Ratio", f"{stats['Sharpe Ratio']:.2f}")
+                cols[3].metric("Win Rate [%]", f"{stats['Win Rate [%]']:.2f}")
+                st.markdown("---")
+
+                st.plotly_chart(plot_fig, use_container_width=True)
+
+                with st.expander("View Detailed Stats"):
+                    st.dataframe(stats)
+
+elif page == "Event Calendar":
+    st.header("📅 Event Calendar")
+
+    tab1, tab2, tab3 = st.tabs(["Upcoming Earnings", "Dividend Dates", "Economic Events"])
+
+    with tab1:
+        st.subheader("Upcoming Earnings For Your Portfolio")
+        if not os.path.exists(PORTFOLIO_CSV):
+            st.info("Your portfolio is empty. Add some stocks via the 'Chat' page to see their earnings dates here.")
+        else:
+            portfolio_df = pd.read_csv(PORTFOLIO_CSV)
+            tickers = portfolio_df['ticker'].unique().tolist()
+            if not tickers:
+                st.info("No tickers found in your portfolio.")
+            else:
+                with st.spinner("Fetching earnings dates..."):
+                    earnings_df = get_earnings_calendar(tickers)
+                    st.dataframe(earnings_df, use_container_width=True)
+
+    with tab2:
+        st.subheader("Upcoming Dividend Dates For Your Portfolio")
+        if not os.path.exists(PORTFOLIO_CSV):
+            st.info("Your portfolio is empty. Add some stocks via the 'Chat' page to see their dividend dates here.")
+        else:
+            portfolio_df = pd.read_csv(PORTFOLIO_CSV)
+            tickers = portfolio_df['ticker'].unique().tolist()
+            if not tickers:
+                st.info("No tickers found in your portfolio.")
+            else:
+                with st.spinner("Fetching dividend dates..."):
+                    dividend_df = get_dividend_dates(tickers)
+                    st.dataframe(dividend_df, use_container_width=True)
+
+    with tab3:
+        st.subheader("Key Economic Events (FOMC, CPI)")
+        with st.spinner("Fetching economic calendar..."):
+            events_df, error_message = get_economic_events()
+            if error_message:
+                st.error(error_message)
+            elif events_df.empty:
+                 st.info("No major upcoming economic events like FOMC or CPI were found.")
+            else:
+                st.dataframe(events_df, use_container_width=True)
+
+elif page == "Macro Indicators":
+    st.header("📈 Key Macroeconomic Indicators")
+
+    if not FRED_API_KEY or FRED_API_KEY == "YOUR_FRED_API_KEY":
+        st.error("FRED_API_KEY not found. Please get a free API key from the FRED website and add it to your .env file to use this feature.")
+        st.stop()
+
+    fred = Fred(api_key=FRED_API_KEY)
+
+    indicators = {
+        'GDPC1': {
+            'name': 'Real Gross Domestic Product (GDP)',
+            'description': 'Measures the inflation-adjusted value of all goods and services produced in the U.S. It is the primary indicator of the economy\'s health.',
+            'units': 'Billions of Chained 2017 Dollars'
+        },
+        'UNRATE': {
+            'name': 'Unemployment Rate',
+            'description': 'The percentage of the total labor force that is jobless but actively seeking employment. A key indicator of labor market health.',
+            'units': 'Percent'
+        },
+        'CPIAUCSL': {
+            'name': 'Consumer Price Index (CPI)',
+            'description': 'Measures the average change over time in the prices paid by urban consumers for a market basket of consumer goods and services. A primary measure of inflation.',
+            'units': 'Index 1982-1984=100'
+        },
+        'DFF': {
+            'name': 'Federal Funds Effective Rate',
+            'description': 'The interest rate at which depository institutions trade federal funds (balances held at Federal Reserve Banks) with each other overnight. It is the central interest rate in the U.S. financial market.',
+            'units': 'Percent'
+        },
+        'UMCSENT': {
+            'name': 'Consumer Sentiment Index',
+            'description': 'A survey-based index measuring consumer confidence in the U.S. economy. It can be a leading indicator of consumer spending.',
+            'units': 'Index 1966:Q1=100'
+        },
+        'HOUST': {
+            'name': 'Housing Starts',
+            'description': 'The number of new residential construction projects that have begun during a month. It is a key indicator of economic strength and the housing market.',
+            'units': 'Thousands of Units'
+        }
+    }
+
+    for series_id, details in indicators.items():
+        st.subheader(details['name'])
+        st.markdown(f"*{details['description']}*")
+
+        with st.spinner(f"Fetching data for {details['name']}..."):
+            data = get_fred_series(series_id, fred)
+
+            if data is not None and not data.empty:
+                latest_value = data.iloc[0]
+                latest_date = data.index[0].strftime('%Y-%m-%d')
+
+                st.metric(label=f"Latest Value ({latest_date})", value=f"{latest_value:,.2f} {details['units']}")
+
+                # Plotting the data (reversing for chronological order in plot)
+                fig = px.line(data.sort_index(ascending=True), title=details['name'], template="plotly_dark")
+                fig.update_layout(xaxis_title='Date', yaxis_title=details['units'], showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning(f"Could not retrieve data for {details['name']}.")
+
+        st.markdown("---")

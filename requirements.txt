@@ -11,3 +11,4 @@ pytrends
 vectorbt
 fredapi
 praw
+anthropic>=0.7.0
