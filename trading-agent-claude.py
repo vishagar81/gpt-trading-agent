@@ -35,6 +35,7 @@ import vectorbt as vbt
 from fredapi import Fred
 import praw
 from anthropic import Anthropic
+import tweepy
 
 # --- Configuration ---
 load_dotenv()
@@ -50,6 +51,11 @@ REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET")
 REDDIT_USER_AGENT = os.environ.get("REDDIT_USER_AGENT", "StockAnalysisBot/1.0")
 NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY")
+TWITTER_API_KEY = os.environ.get("TWITTER_API_KEY")
+TWITTER_API_SECRET = os.environ.get("TWITTER_API_SECRET")
+TWITTER_ACCESS_TOKEN = os.environ.get("TWITTER_ACCESS_TOKEN")
+TWITTER_ACCESS_SECRET = os.environ.get("TWITTER_ACCESS_SECRET")
+TWITTER_BEARER_TOKEN = os.environ.get("TWITTER_BEARER_TOKEN")
 
 # Initialize Claude client
 if not CLAUDE_API_KEY or CLAUDE_API_KEY == "YOUR_CLAUDE_API_KEY":
@@ -761,6 +767,108 @@ def generate_google_trends_queries(ticker, company_name):
         st.error(f"Error calling Claude API for trend queries: {e}")
         return []
 
+def get_twitter_sentiment(ticker, company_name=None, search_type="ticker"):
+    """
+    Fetches recent tweets about a stock and analyzes sentiment using Claude.
+    search_type: "ticker", "hashtag", "keywords", or "company_name"
+    """
+    if not TWITTER_BEARER_TOKEN:
+        return {"error": "Twitter API credentials not set. Add TWITTER_BEARER_TOKEN to .env"}
+
+    if not claude_client:
+        return {"error": "Claude API key is not set. Please add CLAUDE_API_KEY to your .env file."}
+
+    try:
+        # Initialize Twitter client with API v2
+        client = tweepy.Client(bearer_token=TWITTER_BEARER_TOKEN)
+
+        # Build search query based on search type
+        if search_type == "ticker":
+            query = f"${ticker} lang:en -is:retweet"
+        elif search_type == "hashtag":
+            query = f"#{ticker} lang:en -is:retweet"
+        elif search_type == "keywords":
+            query = f"{ticker} stock lang:en -is:retweet"
+        else:  # company_name
+            query = f"{company_name or ticker} stock lang:en -is:retweet"
+
+        # Fetch recent tweets (max 100, recent 7 days)
+        tweets = client.search_recent_tweets(
+            query=query,
+            max_results=100,
+            tweet_fields=['created_at', 'public_metrics'],
+            expansions=['author_id'],
+            user_fields=['username', 'verified']
+        )
+
+        if not tweets.data:
+            return {"sentiment": "NEUTRAL", "score": 0.0, "message": "No recent tweets found for this ticker"}
+
+        # Compile tweet text with engagement metrics
+        tweet_texts = []
+        for tweet in tweets.data[:50]:  # Use top 50 tweets for analysis
+            engagement = tweet.public_metrics['like_count'] + tweet.public_metrics['retweet_count']
+            tweet_texts.append(f"Tweet (engagement: {engagement}): {tweet.text}")
+
+        tweets_summary = "\n".join(tweet_texts[:20])  # Analyze top 20 by relevance
+
+        # Use Claude to analyze sentiment
+        prompt = f"""
+        Analyze the sentiment of these tweets about {ticker} ({company_name or ticker}).
+        Consider tweet engagement metrics when determining overall sentiment.
+        Provide sentiment (BULLISH, NEUTRAL, or BEARISH) and a score from -1 (most bearish) to +1 (most bullish).
+
+        Tweets:
+        {tweets_summary}
+
+        Respond in this exact format:
+        SENTIMENT: [BULLISH/NEUTRAL/BEARISH]
+        SCORE: [number between -1 and 1]
+        SUMMARY: [One sentence summary of overall sentiment]
+        """
+
+        message = claude_client.messages.create(
+            model=MODEL_NAME,
+            max_tokens=300,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            system="You are a financial sentiment analyst. Analyze tweets objectively and provide clear sentiment assessments."
+        )
+
+        response = message.content[0].text
+
+        # Parse Claude's response
+        result = {
+            "ticker": ticker,
+            "tweet_count": len(tweets.data),
+            "analysis_period": "Last 7 days",
+            "raw_analysis": response
+        }
+
+        # Extract structured data from response
+        lines = response.split('\n')
+        for line in lines:
+            if 'SENTIMENT:' in line:
+                result["sentiment"] = line.split('SENTIMENT:')[1].strip()
+            elif 'SCORE:' in line:
+                try:
+                    result["score"] = float(line.split('SCORE:')[1].strip())
+                except:
+                    result["score"] = 0.0
+            elif 'SUMMARY:' in line:
+                result["summary"] = line.split('SUMMARY:')[1].strip()
+
+        return result
+
+    except tweepy.TweepyException as e:
+        return {"error": f"Twitter API error: {str(e)}"}
+    except Exception as e:
+        return {"error": f"Error analyzing Twitter sentiment: {str(e)}"}
+
 def get_google_trends_data(queries, timeframe='today 3-m'):
     """Fetches Google Trends data for a list of queries."""
     if not queries:
@@ -1011,7 +1119,7 @@ if page == "Chat":
              st.session_state.technicals_data = None # Clear if data was empty
 
     # --- Chat Input Logic ---
-    if prompt := st.chat_input("What would you like to do? (e.g., 'find stocks', 'analyze AAPL', 'hedge portfolio', 'get technicals MSFT', 'get trends TSLA', 'get news GME', 'get social sentiment AMZN')"):
+    if prompt := st.chat_input("What would you like to do? (e.g., 'find stocks', 'analyze AAPL', 'hedge portfolio', 'get technicals MSFT', 'get trends TSLA', 'get news GME', 'get social sentiment AMZN', 'get x sentiment TSLA')"):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -1258,6 +1366,65 @@ if page == "Chat":
                         if st.button("Clear Reddit Posts", key="clear_reddit"):
                             st.session_state.reddit_data = None
                             st.rerun()
+
+                elif "get x sentiment" in prompt_lower or "twitter sentiment" in prompt_lower:
+                    ticker = prompt.split(" ")[-1].upper()
+                    st.info(f"Analyzing X (Twitter) sentiment for {ticker}...")
+
+                    # Try to get company name for better analysis
+                    company_name = get_company_name(ticker)
+
+                    # Determine search type
+                    if "$" in prompt:
+                        search_type = "ticker"
+                    elif "#" in prompt:
+                        search_type = "hashtag"
+                    else:
+                        search_type = "keywords"
+
+                    sentiment_result = get_twitter_sentiment(ticker, company_name, search_type)
+
+                    if "error" in sentiment_result:
+                        response_content = f"❌ {sentiment_result['error']}"
+                    elif "message" in sentiment_result:
+                        response_content = f"⚠️ {sentiment_result['message']}"
+                    else:
+                        sentiment = sentiment_result.get("sentiment", "UNKNOWN")
+                        score = sentiment_result.get("score", 0.0)
+                        summary = sentiment_result.get("summary", "")
+                        tweet_count = sentiment_result.get("tweet_count", 0)
+
+                        # Visual indicator for sentiment
+                        if "BULLISH" in sentiment:
+                            emoji = "📈"
+                        elif "BEARISH" in sentiment:
+                            emoji = "📉"
+                        else:
+                            emoji = "➡️"
+
+                        response_content = f"""
+## X (Twitter) Sentiment Analysis for {ticker}
+
+{emoji} **Sentiment**: {sentiment}
+📊 **Score**: {score:.2f} (-1 = Bearish, +1 = Bullish)
+💬 **Tweets Analyzed**: {tweet_count}
+⏱️ **Period**: Last 7 days
+
+**Summary**: {summary}
+
+---
+**Full Analysis**:
+{sentiment_result.get('raw_analysis', '')}
+                        """
+
+                        st.session_state.twitter_sentiment = {
+                            "ticker": ticker,
+                            "sentiment": sentiment,
+                            "score": score,
+                            "summary": summary,
+                            "tweet_count": tweet_count,
+                            "analysis": sentiment_result.get('raw_analysis', '')
+                        }
 
                 else:
                     response_content = "I can help you find stocks, analyze them, hedge your portfolio, or sell positions. What would you like to do?"

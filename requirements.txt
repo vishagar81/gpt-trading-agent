@@ -12,3 +12,4 @@ vectorbt
 fredapi
 praw
 anthropic>=0.7.0
+tweepy>=4.14.0
